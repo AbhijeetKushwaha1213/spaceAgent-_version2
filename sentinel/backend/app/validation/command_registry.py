@@ -20,23 +20,30 @@ issue immediately. Two independent lists of command names cannot be kept in
 agreement by hand, so there is now one list, and a checker that fails if any
 consumer drifts from it.
 
-Condition semantics (tri-state, deliberately permissive)
---------------------------------------------------------
+Condition semantics (tri-state, risk-aware fail-closed)
+-------------------------------------------------------
 Each ``Condition`` is a predicate about spacecraft state that evaluates to
 SATISFIED, VIOLATED, or UNKNOWN against the crash-dump context.
 
   required_preconditions   Command is BLOCKED if any listed predicate is
-                           VIOLATED. UNKNOWN does NOT block.
+                           VIOLATED. As of Phase 1 fail-closed hardening, a
+                           required precondition that is UNKNOWN also BLOCKS when
+                           the command is safety-critical (CRITICAL/HIGH), with
+                           reason code MISSING_PRECONDITION — a safety-critical
+                           action is not authorized on the absence of the
+                           affirmative evidence it needs.
   prohibited_conditions    Command is BLOCKED if any listed hazard predicate
                            is SATISFIED (i.e. the hazard is present).
-                           UNKNOWN does NOT block.
+                           UNKNOWN does NOT block — absence of a hazard reading
+                           stays permissive.
 
-UNKNOWN never blocks. This preserves SENTINEL's existing documented policy:
-missing telemetry is permissive, because a ground operator may have confirmed
-the state out of band, and refusing to act on absent data would make the tool
-useless on partial dumps. The consequence is explicit: absence of evidence is
-treated as absence of the hazard. A command with BOTH lists empty is
-unconditionally executable (observation-only).
+The trade-off is now asymmetric and deliberate. Missing HAZARD data is
+permissive (a ground operator may have confirmed the state out of band, and
+refusing to act on absent hazard data would make the tool useless on partial
+dumps). Missing REQUIRED-PRECONDITION data for a safety-critical command is
+fail-closed (absence of evidence is NOT treated as a satisfied precondition).
+A command with BOTH lists empty is unconditionally executable
+(observation-only) and is never affected by either rule.
 """
 
 from __future__ import annotations

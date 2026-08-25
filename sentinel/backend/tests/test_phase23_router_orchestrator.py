@@ -751,7 +751,15 @@ class TestSafety:
         assert res.safety is not None
         assert res.safety.validation is not None
         assert res.safety.sentinel_output is not None
-        assert res.safety.status in ("VALIDATED", "REQUIRES_HUMAN_REVIEW")
+        # Phase 1 (fail-closed): with only {"scenario_id": 1} as safety context,
+        # PROC-ADCS-SEU-001's gyro-dependent step has no gyro telemetry to confirm
+        # its required precondition, so that step fails closed
+        # (MISSING_PRECONDITION) and the plan is PARTIALLY_BLOCKED. This test asserts
+        # the real validator RUNS on the winning path (no bypass) and returns a
+        # genuine terminal verdict — any real safety status satisfies that intent.
+        assert res.safety.status in (
+            "VALIDATED", "REQUIRES_HUMAN_REVIEW", "PARTIALLY_BLOCKED", "BLOCKED",
+        )
 
 
 # ---------------------------------------------------------------------------

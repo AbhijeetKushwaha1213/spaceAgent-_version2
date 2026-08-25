@@ -244,11 +244,51 @@ _SEVERITY_BY_CODE: dict[str, BlockSeverity] = {
     # These deepen an existing fault rather than causing immediate loss.
     "BATTERY_FLOOR": BlockSeverity.HIGH,
     "THERMAL_SURVIVAL": BlockSeverity.HIGH,
+    # Phase 1 fail-closed: a safety-critical command whose required precondition
+    # telemetry is ABSENT (UNKNOWN) cannot be confirmed. The only required
+    # preconditions in the registry today are gyro-health and comms-lock, both
+    # CRITICAL, so a missing one is reported CRITICAL. If a lower-severity
+    # required precondition is ever added, _missing_precondition_violation will
+    # not fire for it (see _FAIL_CLOSED_SEVERITIES), so this stays accurate.
+    "MISSING_PRECONDITION": BlockSeverity.CRITICAL,
 }
 
 
 def _severity_for(code: str) -> BlockSeverity:
     return _SEVERITY_BY_CODE.get(code, BlockSeverity.HIGH)
+
+
+# ── Phase 1 fail-closed reason-code vocabulary ────────────────────────────────
+# Machine-readable reason codes the deterministic safety gate can attach to a
+# blocked step. Two groups:
+#
+#   EMITTED   — produced by this module today.
+#   RESERVED  — name failure modes that are NOT yet detected at the
+#               command-authorization boundary. They are declared so the
+#               vocabulary is stable for downstream consumers, but nothing emits
+#               them. Do NOT wire a detector that always no-ops just to "use" a
+#               reserved code — that would be demo-only behaviour. Adding real
+#               staleness / contradiction / toxic-pair / physics-refutation
+#               detection is out of scope for Phase 1 (see the Phase 1 report).
+#
+# EMITTED:
+REASON_CODE_MISSING_PRECONDITION = "MISSING_PRECONDITION"  # required-precondition telemetry absent (UNKNOWN)
+REASON_CODE_UNKNOWN_TELEMETRY = "UNKNOWN_TELEMETRY"        # category tag carried in supporting_context for the above
+REASON_CODE_INVALID_TELEMETRY = "INVALID_TELEMETRY"        # present-but-malformed telemetry (reported today via the condition's own code, e.g. GYRO_HEALTH_PREREQUISITE)
+REASON_CODE_COMMAND_NOT_WHITELISTED = "NOT_IN_REGISTRY"    # existing behaviour; COMMAND_NOT_WHITELISTED is the spec alias for this code
+# RESERVED (not emitted by any current code path):
+REASON_CODE_STALE_TELEMETRY = "STALE_TELEMETRY"
+REASON_CODE_CONTRADICTORY_TELEMETRY = "CONTRADICTORY_TELEMETRY"
+REASON_CODE_TOXIC_COMMAND_CONFLICT = "TOXIC_COMMAND_CONFLICT"
+REASON_CODE_PHYSICS_REFUTED = "PHYSICS_REFUTED"
+
+# Severities at which a MISSING (UNKNOWN) required precondition blocks the
+# command fail-closed. CRITICAL/HIGH block; anything lower stays permissive on
+# absence, matching the approved Phase 1 policy (required-precondition only,
+# risk-aware).
+_FAIL_CLOSED_SEVERITIES: frozenset[BlockSeverity] = frozenset(
+    {BlockSeverity.CRITICAL, BlockSeverity.HIGH}
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -498,6 +538,48 @@ def _violation_from_condition(
     )
 
 
+def _missing_precondition_violation(
+    command: str,
+    condition: Condition,
+    support: dict[str, Any],
+) -> ConstraintViolation | None:
+    """Phase 1 fail-closed (RED-01 fix).
+
+    A REQUIRED precondition evaluated to UNKNOWN — the telemetry it depends on is
+    absent from the crash dump, so the precondition cannot be confirmed. A
+    safety-critical command that declares it must NOT be authorized on absent
+    evidence. Returns a blocking ConstraintViolation, or None when the condition
+    is not safety-critical (CRITICAL/HIGH), in which case absence stays permissive
+    per the approved policy.
+
+    This is deliberately asymmetric: it fires only for REQUIRED preconditions
+    (affirmative evidence a command needs to be safe). Prohibited hazards that are
+    UNKNOWN remain non-blocking — a present hazard still blocks via
+    ``_violation_from_condition``, unchanged.
+    """
+    underlying = CONDITION_VIOLATION_CODE.get(condition, condition.value)
+    if _severity_for(underlying) not in _FAIL_CLOSED_SEVERITIES:
+        return None
+    return ConstraintViolation(
+        code=REASON_CODE_MISSING_PRECONDITION,
+        reason=(
+            f"Required precondition '{condition.value}' is UNKNOWN: the telemetry "
+            f"it depends on is absent from the crash dump, so it cannot be "
+            f"confirmed. Command '{command}' is safety-critical, so it is blocked "
+            f"fail-closed — absent evidence is not treated as a satisfied "
+            f"precondition."
+        ),
+        subsystem=CONDITION_SUBSYSTEM.get(condition),
+        condition=condition.value,
+        supporting_context={
+            **support,
+            "telemetry_state": ConditionState.UNKNOWN.value,
+            "reason_category": REASON_CODE_UNKNOWN_TELEMETRY,
+            "underlying_condition_code": underlying,
+        },
+    )
+
+
 # Fixed evaluation order for the physical quantities, as (positive, hazard).
 #
 # Deliberately NOT the registry declaration order. When more than one constraint
@@ -539,6 +621,15 @@ def evaluate_declared_conditions(
             state, support = evaluate_condition(positive, ctx)
             if state is ConditionState.VIOLATED:
                 return _violation_from_condition(step.command, positive, support)
+            if state is ConditionState.UNKNOWN:
+                # Phase 1 fail-closed: a required precondition whose telemetry is
+                # absent cannot be confirmed. Blocks for safety-critical
+                # conditions; returns None (stays permissive) otherwise.
+                missing = _missing_precondition_violation(
+                    step.command, positive, support
+                )
+                if missing is not None:
+                    return missing
         elif hazard in prohibited:
             state, support = evaluate_condition(hazard, ctx)
             if state is ConditionState.SATISFIED:  # hazard is present
@@ -570,14 +661,19 @@ def _check_single_condition(
     condition = positive if declares_required else hazard
     state, support = evaluate_condition(condition, ctx)
 
-    blocked = (
-        state is ConditionState.VIOLATED if declares_required
-        else state is ConditionState.SATISFIED
-    )
-    if not blocked:
+    if declares_required:
+        if state is ConditionState.VIOLATED:
+            return _violation_from_condition(step.command, condition, support)
+        if state is ConditionState.UNKNOWN:
+            # Phase 1 fail-closed for a required precondition whose telemetry is
+            # absent. Returns None (permissive) for non-safety-critical conditions.
+            return _missing_precondition_violation(step.command, condition, support)
         return None
 
-    return _violation_from_condition(step.command, condition, support)
+    # Prohibited hazard: a present hazard blocks; absence stays permissive.
+    if state is ConditionState.SATISFIED:
+        return _violation_from_condition(step.command, condition, support)
+    return None
 
 
 def check_battery_floor(
@@ -605,8 +701,10 @@ def check_gyro_health_prerequisite(
     """Block attitude actuation when gyro rate data is invalid.
 
     Gyro data is invalid when it is present but None, NaN, or non-numeric.
-    Absent gyro data is permissive — the sensor may be healthy and simply not
-    included in the dump.
+    Phase 1 fail-closed: gyro rate is a REQUIRED precondition (CRITICAL), so
+    absent gyro data now blocks with MISSING_PRECONDITION rather than being
+    treated as permissive — attitude actuation must not be authorized when the
+    sensor's health cannot be confirmed.
     """
     return _check_single_condition(
         step, ctx,
@@ -623,8 +721,10 @@ def check_comms_lock_for_reboot(
 
     Rebooting without a comms lock risks losing the uplink during the reboot
     window, which could make the spacecraft unrecoverable. An explicitly absent
-    lock blocks; a missing lock reading is permissive, because the operator may
-    have confirmed it out of band.
+    lock blocks. Phase 1 fail-closed: comms-lock is a REQUIRED precondition
+    (CRITICAL), so a MISSING lock reading now also blocks with
+    MISSING_PRECONDITION — the lock must be positively confirmed, not assumed
+    from silence.
     """
     return _check_single_condition(
         step, ctx,

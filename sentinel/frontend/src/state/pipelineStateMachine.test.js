@@ -20,6 +20,7 @@ import {
   PIPELINE_STAGES,
   computeHighestStageIndex,
   derivePipelineProgress,
+  deriveSafetyStageView,
 } from "./pipelineStateMachine";
 
 describe("Live Pipeline State Machine", () => {
@@ -209,5 +210,129 @@ describe("Live Pipeline State Machine", () => {
 
     expect(progress.isComplete).toBe(false);
     expect(progress.stages[9].status).toBe("pending");
+  });
+
+  test("12. Partially blocked: Phase 1 fail-closed block surfaced on safety stage", () => {
+    // Scenario-3-shaped output: the OBC reboot is fail-closed blocked because its
+    // required comms-lock precondition is UNKNOWN (telemetry absent), while the
+    // observation-only steps are authorized. The safety stage must show a visible,
+    // non-green block — not a clean completed stage.
+    const sampleOutput = {
+      hypotheses: [
+        { rank: 1, fault_id: "OBC_WATCHDOG_OVERFLOW", confidence: 0.7, subsystem: "OBC" },
+        { rank: 2, fault_id: "INSUFFICIENT_EVIDENCE", confidence: 0.2, subsystem: "UNKNOWN" },
+        { rank: 3, fault_id: "INSUFFICIENT_EVIDENCE", confidence: 0.1, subsystem: "UNKNOWN" },
+      ],
+      recovery_plan: [
+        { step: 1, command: "CMD_CONFIRM_COMMS_LOCK", wait_seconds: 5, verify: "lock", risk: "LOW" },
+        { step: 2, command: "CMD_HEALTH_CHECK", wait_seconds: 5, verify: "ok", risk: "LOW" },
+      ],
+      blocked_steps: [
+        {
+          command: "CMD_OBC_CONTROLLED_REBOOT",
+          reason:
+            "Required precondition 'COMMS_LOCK_CONFIRMED' is UNKNOWN: the telemetry it " +
+            "depends on is absent from the crash dump, so it cannot be confirmed.",
+          violated_constraint: "MISSING_PRECONDITION",
+          severity: "CRITICAL",
+          subsystem: "OBC",
+          supporting_context: {
+            telemetry_state: "UNKNOWN",
+            reason_category: "UNKNOWN_TELEMETRY",
+          },
+        },
+      ],
+      safety_status: "PARTIALLY_BLOCKED",
+      requires_human_review: true,
+    };
+
+    const progress = derivePipelineProgress({
+      analysis: { status: "COMPLETE", events: [], output: sampleOutput },
+    });
+
+    // Safety stage: visibly blocked, not a clean green completion.
+    expect(progress.stages[7].status).toBe("blocked");
+    expect(progress.stages[7].badge).toBe("PARTIALLY BLOCKED");
+    // Detail is derived from real emitted fields (constraint code + authorized count).
+    expect(progress.stages[7].detail).toContain("MISSING_PRECONDITION");
+    expect(progress.stages[7].detail).toContain("2 authorized");
+    expect(progress.stages[7].detail).toContain("Human review required");
+    // Recovery stage reflects the mandatory human review.
+    expect(progress.stages[8].badge).toBe("HUMAN REVIEW");
+  });
+});
+
+describe("deriveSafetyStageView (real safety-stage data, no fabricated PASS rows)", () => {
+  test("validated output with no blocks: truthful 'none refused' note", () => {
+    const view = deriveSafetyStageView({
+      safety_status: "VALIDATED",
+      recovery_plan: [{ step: 1, command: "CMD_HEALTH_CHECK" }],
+      blocked_steps: [],
+    });
+    expect(view.status).toBe("VALIDATED");
+    expect(view.evaluated).toBe(true);
+    expect(view.blocked).toHaveLength(0);
+    expect(view.note).toBe("No commands were refused by the safety validator.");
+  });
+
+  test("partially blocked: fail-closed block surfaced from real fields", () => {
+    const view = deriveSafetyStageView({
+      safety_status: "PARTIALLY_BLOCKED",
+      recovery_plan: [{ step: 1, command: "CMD_HEALTH_CHECK" }],
+      blocked_steps: [
+        {
+          command: "CMD_OBC_CONTROLLED_REBOOT",
+          reason: "Required precondition 'COMMS_LOCK_CONFIRMED' is UNKNOWN ...",
+          violated_constraint: "MISSING_PRECONDITION",
+          severity: "CRITICAL",
+          subsystem: "OBC",
+          supporting_context: { telemetry_state: "UNKNOWN", reason_category: "UNKNOWN_TELEMETRY" },
+        },
+      ],
+    });
+    expect(view.status).toBe("PARTIALLY_BLOCKED");
+    expect(view.blocked).toHaveLength(1);
+    expect(view.blocked[0].command).toBe("CMD_OBC_CONTROLLED_REBOOT");
+    expect(view.blocked[0].constraint).toBe("MISSING_PRECONDITION");
+    expect(view.blocked[0].severity).toBe("CRITICAL");
+    expect(view.blocked[0].reasonCategory).toBe("UNKNOWN_TELEMETRY");
+    expect(view.note).toBe("1 command(s) refused by the safety validator.");
+  });
+
+  test("fully blocked: every proposed command refused", () => {
+    const view = deriveSafetyStageView({
+      safety_status: "BLOCKED",
+      recovery_plan: [],
+      blocked_steps: [
+        { command: "CMD_SUN_ACQUISITION", violated_constraint: "MISSING_PRECONDITION", severity: "CRITICAL" },
+      ],
+    });
+    expect(view.status).toBe("BLOCKED");
+    expect(view.blocked).toHaveLength(1);
+    expect(view.note).toBe("1 command(s) refused by the safety validator.");
+  });
+
+  test("no output / not validated: does not imply a pass", () => {
+    expect(deriveSafetyStageView(null)).toEqual({
+      status: "NOT_VALIDATED",
+      evaluated: false,
+      blocked: [],
+      note: "Safety validation status not available.",
+    });
+    const nv = deriveSafetyStageView({ safety_status: "NOT_VALIDATED", blocked_steps: [] });
+    expect(nv.evaluated).toBe(false);
+    expect(nv.note).toBe("Safety validation status not available.");
+  });
+
+  test("missing violated_constraint falls back to BLOCKED, missing optional fields are null", () => {
+    const view = deriveSafetyStageView({
+      safety_status: "BLOCKED",
+      recovery_plan: [],
+      blocked_steps: [{ command: "CMD_MYSTERY" }],
+    });
+    expect(view.blocked[0].constraint).toBe("BLOCKED");
+    expect(view.blocked[0].severity).toBeNull();
+    expect(view.blocked[0].reason).toBeNull();
+    expect(view.blocked[0].reasonCategory).toBeNull();
   });
 });

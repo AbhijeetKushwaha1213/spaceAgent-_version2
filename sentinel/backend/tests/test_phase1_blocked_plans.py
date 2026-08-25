@@ -418,11 +418,18 @@ class TestKnownConflictRegressions(unittest.TestCase):
     }
 
     def test_each_kb_sequence_validates_cleanly(self):
-        # Permissive context: nothing physically prohibits these plans, so the
-        # only thing under test is registry/procedure agreement.
+        # The context supplies the telemetry the safety-critical steps legitimately
+        # require: a valid gyro rate (for the ADCS attitude step) and a confirmed
+        # transponder lock (for the OBC controlled reboot). Phase 1 fail-closed
+        # hardening requires those preconditions to be PRESENT in telemetry, not
+        # merely un-refuted, so this test now proves procedure/registry agreement on
+        # the good path where the preconditions are actually met. (Previously the
+        # context was {"GYRO_A_RATE": 0.1} and the OBC reboot validated only because
+        # an absent lock was treated permissively — the RED-01 behavior.)
+        ctx = {"GYRO_A_RATE": 0.1, "TRANSPONDER_LOCK": 1}
         for fault, sequence in sorted(self.KB_SEQUENCES.items()):
             with self.subTest(fault=fault):
-                r = validated(sequence, ctx={"GYRO_A_RATE": 0.1})
+                r = validated(sequence, ctx=ctx)
                 self.assertEqual(
                     r.safety_status, SafetyStatus.VALIDATED,
                     msg=f"{fault}: {[b.command for b in r.blocked_steps]}",
@@ -450,9 +457,13 @@ class TestKnownConflictRegressions(unittest.TestCase):
     def test_dataset_generator_plans_all_validate(self):
         from simulation.dataset_generator import _RECOVERY_COMMANDS
 
+        # Supply the preconditions the safety-critical steps require (gyro rate +
+        # confirmed comms lock). Phase 1 fail-closed hardening requires these to be
+        # present in telemetry rather than assumed absent-therefore-safe.
+        ctx = {"GYRO_A_RATE": 0.1, "TRANSPONDER_LOCK": 1}
         for fault, sequence in sorted(_RECOVERY_COMMANDS.items()):
             with self.subTest(fault=fault):
-                r = validated(list(sequence), ctx={"GYRO_A_RATE": 0.1})
+                r = validated(list(sequence), ctx=ctx)
                 self.assertEqual(
                     r.blocked_steps, [],
                     msg=f"{fault}: {[b.command for b in r.blocked_steps]}",
@@ -509,9 +520,16 @@ class TestConstraintGuardsStillFire(unittest.TestCase):
                     "GYRO_HEALTH_PREREQUISITE",
                 )
 
-    def test_gyro_permissive_when_absent(self):
+    def test_gyro_required_fails_closed_when_absent(self):
+        # Phase 1 (fail-closed): CMD_SUN_ACQUISITION requires GYRO_DATA_VALID. An
+        # empty context means the gyro channel is absent, so that precondition is
+        # UNKNOWN. A CRITICAL command must not be authorized on absent evidence, so
+        # it now blocks with MISSING_PRECONDITION. This previously asserted VALIDATED
+        # — the permissive-UNKNOWN behavior (RED-01) this phase removes.
         r = validated(["CMD_SUN_ACQUISITION"], ctx={})
-        self.assertEqual(r.safety_status, SafetyStatus.VALIDATED)
+        self.assertEqual(r.safety_status, SafetyStatus.BLOCKED)
+        codes = {b.violated_constraint for b in r.blocked_steps}
+        self.assertIn("MISSING_PRECONDITION", codes)
 
     def test_comms_lock_before_reboot(self):
         for bad in (0, False, "0", "false", "no"):

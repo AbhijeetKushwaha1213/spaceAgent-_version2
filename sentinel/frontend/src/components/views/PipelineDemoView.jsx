@@ -18,6 +18,7 @@
 
 import React, { useState } from "react";
 import { useSentinel } from "../../state/SentinelContext";
+import { deriveSafetyStageView } from "../../state/pipelineStateMachine";
 import Panel from "../ui/Panel";
 import StatusBadge from "../ui/StatusBadge";
 import PipelineStepper from "../ui/PipelineStepper";
@@ -431,21 +432,47 @@ export default function PipelineDemoView({ onNavigate }) {
             )}
 
             {/* STAGE 8: SAFETY VALIDATION */}
-            {displayStage.id === "safety" && (
-              <div style={{ background: "rgba(0,0,0,0.3)", padding: "0.8rem", borderRadius: "5px" }}>
-                <div style={{ fontWeight: "600", color: "#f87171", marginBottom: "0.3rem" }}>
-                  Telecommand Interlocks &amp; Flight Rules (SAFETY = AUTHORITY):
+            {displayStage.id === "safety" && (() => {
+              // Real, data-driven safety verdict — no fabricated pass/fail rows.
+              // Everything shown here is read from the deterministic validator's
+              // emitted fields (safety_status + blocked_steps).
+              const safetyView = deriveSafetyStageView(output);
+              return (
+                <div style={{ background: "rgba(0,0,0,0.3)", padding: "0.8rem", borderRadius: "5px" }}>
+                  <div style={{ fontWeight: "600", color: "#f87171", marginBottom: "0.3rem" }}>
+                    Telecommand Interlocks &amp; Flight Rules (SAFETY = AUTHORITY):
+                  </div>
+                  <div style={{ fontSize: "0.82rem", color: "#cbd5e1", marginBottom: "0.3rem" }}>
+                    Deterministic safety verdict:{" "}
+                    <strong style={{ color: safetyView.blocked.length > 0 ? "#f87171" : "#34d399" }}>
+                      {safetyView.status}
+                    </strong>
+                  </div>
+                  {safetyView.blocked.length > 0 ? (
+                    <ul style={{ margin: 0, paddingLeft: "1.2rem", fontSize: "0.82rem", color: "#cbd5e1" }}>
+                      {safetyView.blocked.map((b, i) => (
+                        <li key={i} style={{ marginBottom: "0.2rem" }}>
+                          <code>{b.command}</code> —{" "}
+                          <strong style={{ color: "#f87171" }}>{b.constraint}</strong>
+                          {b.severity ? ` [${b.severity}]` : ""}
+                          {b.reasonCategory ? (
+                            <span style={{ color: "#fbbf24" }}> · {b.reasonCategory}</span>
+                          ) : null}
+                          {b.reason ? (
+                            <div style={{ color: "#94a3b8", fontSize: "0.76rem" }}>{b.reason}</div>
+                          ) : null}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <div style={{ fontSize: "0.82rem", color: "#cbd5e1" }}>{safetyView.note}</div>
+                  )}
+                  <div style={{ marginTop: "0.4rem", fontSize: "0.78rem", color: "#ef4444", fontWeight: "bold" }}>
+                    🛡 Safety validator holds absolute veto power over AI proposed commands.
+                  </div>
                 </div>
-                <ul style={{ margin: 0, paddingLeft: "1.2rem", fontSize: "0.82rem", color: "#cbd5e1" }}>
-                  <li>Battery Floor Rule: <code>SOC &gt; 40% Required</code> (Status: PASS)</li>
-                  <li>Attitude Rate Threshold: <code>&lt; 0.5 deg/s</code> (Status: PASS)</li>
-                  <li>Thermal Survival Floor: <code>T &gt; -20°C</code> (Status: PASS)</li>
-                </ul>
-                <div style={{ marginTop: "0.4rem", fontSize: "0.78rem", color: "#ef4444", fontWeight: "bold" }}>
-                  🛡 Safety validator holds absolute veto power over AI proposed commands.
-                </div>
-              </div>
-            )}
+              );
+            })()}
 
             {/* STAGE 9: RECOVERY DECISION */}
             {displayStage.id === "recovery" && (

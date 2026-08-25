@@ -168,7 +168,16 @@ def _run_safety(crash, sentinel_dict):
     return result, val
 
 
-def test_safety_1_valid_recovery_approved():
+def test_safety_1_obc_reboot_blocked_when_lock_unconfirmed():
+    # Phase 1 (fail-closed safety hardening) intentionally changed this outcome.
+    # Scenario 3 (OBC_WATCHDOG_OVERFLOW) carries NO transponder-lock telemetry, so
+    # COMMS_LOCK_CONFIRMED evaluates to UNKNOWN. CMD_OBC_CONTROLLED_REBOOT declares
+    # that lock as a required (CRITICAL) precondition, so it now fails closed with
+    # MISSING_PRECONDITION rather than being authorized on absent evidence — the
+    # old permissive-UNKNOWN behavior (RED-01) this phase exists to remove. The
+    # other steps (confirm lock, verify memory, exit safe mode) declare no required
+    # precondition and still validate, so the plan is PARTIALLY_BLOCKED and routed
+    # to human review. Previously this asserted a clean 4-step VALIDATED plan.
     crash, ri, physics = _pipeline("3")
     raw = json.dumps({
         "ranked_hypotheses": [{
@@ -183,10 +192,13 @@ def test_safety_1_valid_recovery_approved():
     })
     gr, final = _sentinel_from_raw(ri, physics, raw)
     result, val = _run_safety(crash, convert_to_sentinel_output(final, None))
-    assert val.safety_status.value == "VALIDATED"
-    assert len(val.validated_steps) == 4
-    assert len(val.blocked_steps) == 0
-    assert not result.requires_human_review
+    assert val.safety_status.value == "PARTIALLY_BLOCKED"
+    blocked = {b.original_step.command: b.violation_code for b in val.blocked_steps}
+    assert blocked == {"CMD_OBC_CONTROLLED_REBOOT": "MISSING_PRECONDITION"}
+    validated = [s.command for s in val.validated_steps]
+    assert "CMD_OBC_CONTROLLED_REBOOT" not in validated
+    assert len(validated) == 3  # confirm-lock, verify-memory, exit-safe-mode
+    assert result.requires_human_review
 
 
 def test_safety_2_invalid_command_blocked():
@@ -211,8 +223,15 @@ def test_safety_2_invalid_command_blocked():
     }
     result, val = _run_safety(crash, out)
     codes = {b.violation_code for b in val.blocked_steps}
+    # CMD_FIRE_THRUSTERS_90 is not in the registry (unchanged behavior).
     assert "NOT_IN_REGISTRY" in codes
-    assert [s.command for s in val.validated_steps] == ["CMD_OBC_CONTROLLED_REBOOT"]
+    # Phase 1 (fail-closed): scenario 3 has no confirmed comms lock, so the OBC
+    # reboot ALSO blocks with MISSING_PRECONDITION rather than validating on absent
+    # evidence. With no step surviving, the plan is fully BLOCKED. Previously the
+    # reboot was the lone validated step.
+    assert "MISSING_PRECONDITION" in codes
+    assert [s.command for s in val.validated_steps] == []
+    assert val.safety_status.value == "BLOCKED"
     assert result.requires_human_review
 
 

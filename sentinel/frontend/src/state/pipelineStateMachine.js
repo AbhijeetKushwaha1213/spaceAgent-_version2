@@ -192,6 +192,24 @@ export function derivePipelineProgress({
         stageStatus = "blocked";
         detail = `Safety Interlock BLOCKED recovery: ${output?.safety_reason || "Safety constraints violated"}`;
         badge = "BLOCKED";
+      } else if (stage.id === "safety" && output?.safety_status === "PARTIALLY_BLOCKED") {
+        // Phase 1 fail-closed hardening: one or more safety-critical commands were
+        // refused (e.g. a required precondition was UNKNOWN — telemetry absent)
+        // while other steps were authorized. This MUST NOT render as a clean
+        // (green) completed safety stage — the operator has to see that the
+        // safety validator intervened. Detail is derived only from real emitted
+        // fields (blocked_steps / recovery_plan); nothing is fabricated.
+        stageStatus = "blocked";
+        const blockedList = output?.blocked_steps || [];
+        const constraints = [
+          ...new Set(blockedList.map((b) => b.violated_constraint).filter(Boolean)),
+        ];
+        const constraintText = constraints.length ? ` (${constraints.join(", ")})` : "";
+        const authorizedCount = output?.recovery_plan?.length || 0;
+        detail =
+          `Safety Interlock blocked ${blockedList.length} command(s)${constraintText}; ` +
+          `${authorizedCount} authorized. Human review required.`;
+        badge = "PARTIALLY BLOCKED";
       } else if (stage.id === "physics") {
         const topVerdict = physicsReport?.data?.verdicts?.[0];
         if (topVerdict?.validation_status === "INVALID") {
@@ -280,4 +298,40 @@ export function derivePipelineProgress({
       ? `STAGE ${activeIndex + 1}/${PIPELINE_STAGES.length}: ${activeStage?.name?.toUpperCase()}`
       : "STANDING BY",
   };
+}
+
+/**
+ * Derive the SAFETY-stage display from the real analysis output.
+ *
+ * There are NO fabricated pass/fail rows here: every value returned is read
+ * straight from backend-emitted fields (``safety_status`` and the
+ * ``blocked_steps`` the deterministic safety validator produced). Presentational
+ * components map this to markup. When nothing was blocked the note says so
+ * truthfully; when safety has not been evaluated it says THAT rather than
+ * implying a pass. This replaces a previous static "(Status: PASS)" list that
+ * displayed the same rows regardless of the real verdict.
+ */
+export function deriveSafetyStageView(output) {
+  const status = output?.safety_status || "NOT_VALIDATED";
+  const evaluated = status !== "NOT_VALIDATED";
+  const blocked = (output?.blocked_steps || []).map((b) => ({
+    command: b.command,
+    constraint: b.violated_constraint || "BLOCKED",
+    severity: b.severity || null,
+    reason: b.reason || null,
+    // reason_category (e.g. UNKNOWN_TELEMETRY) rides in supporting_context; it is
+    // the machine-readable tag for a fail-closed-on-missing-telemetry block.
+    reasonCategory: b.supporting_context?.reason_category || null,
+  }));
+
+  let note;
+  if (!evaluated) {
+    note = "Safety validation status not available.";
+  } else if (blocked.length === 0) {
+    note = "No commands were refused by the safety validator.";
+  } else {
+    note = `${blocked.length} command(s) refused by the safety validator.`;
+  }
+
+  return { status, evaluated, blocked, note };
 }

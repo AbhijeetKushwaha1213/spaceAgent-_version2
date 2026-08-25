@@ -10,17 +10,28 @@ Every predicate is TRI-STATE:
     VIOLATED   the predicate demonstrably does not hold
     UNKNOWN    the context does not contain the data needed to decide
 
-Policy: UNKNOWN NEVER BLOCKS.
+Policy (as of Phase 1 fail-closed hardening):
 
-This is a deliberate, documented trade-off carried over from the pre-Phase-1
-validator. Crash dumps are frequently partial, and a ground operator may have
-confirmed a state out of band. Refusing to act on absent data would make the
-tool unusable on real dumps. The cost is that absence of evidence is treated as
-absence of the hazard, so a blocked-step list is evidence of a detected hazard,
-never proof that no hazard exists.
+This module only computes the tri-state verdict; how each state is treated is
+decided by the safety gate (``app/agent/safety.py``). The gate's policy is
+risk-aware:
+
+  * A **prohibited hazard** that is UNKNOWN does NOT block — a present hazard
+    still blocks, but absence of a hazard reading stays permissive, because a
+    ground operator may have confirmed the state out of band and refusing to act
+    on absent hazard data would make the tool unusable on partial dumps.
+  * A **required precondition** that is UNKNOWN BLOCKS when the command is
+    safety-critical (CRITICAL/HIGH consequence), with reason code
+    ``MISSING_PRECONDITION``. A safety-critical action must not be authorized on
+    the *absence* of the affirmative evidence it needs. Lower-severity required
+    preconditions remain permissive on UNKNOWN.
+
+The consequence: a blocked-step list is evidence of a detected hazard OR of an
+unconfirmable safety-critical precondition — never proof that no hazard exists.
 
 The extraction helpers in this module were moved here from safety.py unchanged,
-so the tri-state verdicts reproduce the previous behaviour exactly.
+so the tri-state verdicts reproduce the previous behaviour exactly; only the
+gate's treatment of UNKNOWN for required preconditions changed in Phase 1.
 """
 
 from __future__ import annotations
@@ -387,6 +398,13 @@ def _eval_comms_lock(ctx: dict[str, Any]) -> tuple[ConditionState, dict[str, Any
     if value == "NOT_FOUND":
         return ConditionState.UNKNOWN, {"transponder_lock": None}
     support = {"transponder_lock": value}
+    if is_value_nan_or_missing(value):
+        # Present but malformed (None / NaN / "NaN" / ""): the reading cannot
+        # confirm a lock. A CRITICAL required precondition must not be treated as
+        # SATISFIED on garbage — symmetric with _eval_gyro. (A wholly ABSENT lock
+        # is UNKNOWN, handled above; that path is fail-closed for safety-critical
+        # commands by the safety gate.)
+        return ConditionState.VIOLATED, support
     if value in _NO_LOCK_VALUES:
         return ConditionState.VIOLATED, support
     return ConditionState.SATISFIED, support
